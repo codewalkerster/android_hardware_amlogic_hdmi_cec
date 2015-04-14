@@ -220,7 +220,8 @@ static void hdmitx_cec_set_option(const struct hdmi_cec_device* dev, int flag, i
             write(fd, "0x0", 3);
         break;
     case HDMI_OPTION_WAKEUP:
-        write(fd, "0xf", 3);
+        //Function: Automatic wake-up
+        //write(fd, "0xf", 3);
         break;
     case HDMI_OPTION_SYSTEM_CEC_CONTROL:
         ALOGE("%s[%d]HDMI_OPTION_SYSTEM_CEC_CONTROL TODO\n", __func__, __LINE__);

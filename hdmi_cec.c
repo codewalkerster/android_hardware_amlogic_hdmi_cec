@@ -74,7 +74,7 @@ static int dev_fd = -1;
  */
 static int hdmitx_cec_add_logical_address(const struct hdmi_cec_device* dev, cec_logical_address_t addr)
 {
-    ALOGE("%s[%d] dev = 0x%x addr = %d\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)addr);
+    ALOGE("%s[%d] dev = %p addr = %d\n", __func__, __LINE__, dev, (unsigned int)addr);
     return 0;
 }
 
@@ -87,7 +87,7 @@ static int hdmitx_cec_add_logical_address(const struct hdmi_cec_device* dev, cec
  */
 static void hdmitx_cec_clear_logical_address(const struct hdmi_cec_device* dev)
 {
-    ALOGE("%s[%d] dev = 0x%x\n", __func__, __LINE__, (unsigned int)dev);
+    ALOGE("%s[%d] dev = %p\n", __func__, __LINE__, dev);
 }
 
 /*
@@ -133,7 +133,7 @@ static int hdmitx_cec_get_physical_address(const struct hdmi_cec_device* dev, ui
  */
 static int hdmitx_cec_send_message(const struct hdmi_cec_device* dev, const cec_message_t* msg)
 {
-    ALOGE("%s[%d] dev = 0x%x  msg = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)msg);
+    ALOGE("%s[%d] dev = %p  msg = %p\n", __func__, __LINE__, dev, msg);
     return HDMI_RESULT_SUCCESS;
 }
 
@@ -159,7 +159,7 @@ static void hdmitx_cec_register_event_callback(const struct hdmi_cec_device* dev
  */
 static void hdmitx_cec_get_version(const struct hdmi_cec_device* dev, int* version)
 {
-    ALOGE("%s[%d] dev = 0x%x  version = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)version);
+    ALOGE("%s[%d] dev = %p  version = %p\n", __func__, __LINE__, dev, version);
     *version = 0x14;
 }
 
@@ -170,7 +170,7 @@ static void hdmitx_cec_get_version(const struct hdmi_cec_device* dev, int* versi
  */
 static void hdmitx_cec_get_vendor_id(const struct hdmi_cec_device* dev, uint32_t* vendor_id)
 {
-    ALOGE("%s[%d] dev = 0x%x  vendor_id = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)vendor_id);
+    ALOGE("%s[%d] dev = %p  vendor_id = %p\n", __func__, __LINE__, dev, vendor_id);
     *vendor_id = 0x4321;
 }
 
@@ -192,7 +192,7 @@ static struct hdmi_port_info hdmitx_port0 = {
 static void hdmitx_cec_get_port_info(const struct hdmi_cec_device* dev,
         struct hdmi_port_info* list[], int* total)
 {
-    ALOGE("%s[%d] dev = 0x%x  list = 0x%x  total = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)list, (unsigned int)total);
+    ALOGE("%s[%d] dev = %p  list = %p  total = %p\n", __func__, __LINE__, dev, list, total);
     *total = 1;
     list[0] = &hdmitx_port0;
 }
@@ -206,7 +206,7 @@ static void hdmitx_cec_set_option(const struct hdmi_cec_device* dev, int flag, i
 {
     int fd = 0;
 
-    ALOGE("%s[%d] dev = 0x%x  flag = 0x%x  value = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)flag, (unsigned int)value);
+    ALOGE("%s[%d] dev = %p  flag = %p  value = %p\n", __func__, __LINE__, dev, flag, value);
     fd = open(HDMITX_CEC_CONFIG_SYSFS, O_WRONLY);
     if (fd < 0) {
         ALOGE("%s[%d][FILE]%s open failed\n", __func__, __LINE__, HDMITX_CEC_CONFIG_SYSFS);
@@ -242,7 +242,7 @@ static void hdmitx_cec_set_option(const struct hdmi_cec_device* dev, int flag, i
  */
 static void hdmitx_cec_set_audio_return_channel(const struct hdmi_cec_device* dev, int flag)
 {
-    ALOGE("%s[%d] dev = 0x%x  flag = 0x%x\n", __func__, __LINE__, (unsigned int)dev, (unsigned int)flag);
+    ALOGE("%s[%d] dev = %p  flag = %p\n", __func__, __LINE__, dev, flag);
 }
 
 /*
@@ -269,7 +269,7 @@ static int hdmitx_cec_is_connected(const struct hdmi_cec_device* dev, int port_i
 /** Close the hdmitx cec device */
 static int hdmitx_cec_close(struct hw_device_t *dev)
 {
-    ALOGE("%s[%d] dev = 0x%x n", __func__, __LINE__, (unsigned int)dev);
+    ALOGE("%s[%d] dev = %p n", __func__, __LINE__, dev);
     if (dev_fd)
         close(dev_fd);
     free(dev);

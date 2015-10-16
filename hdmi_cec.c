@@ -17,19 +17,15 @@
  *     Amlogic HDMITX CEC HAL
  *       Copyright (C) 2014
  *
- * This implements a hdmitx cec hardware library for the Android emulator.
+ * This implements a hdmi cec hardware library for the Android emulator.
  * the following code should be built as a shared library that will be
- * placed into /system/lib/hw/hdmitx_cec.so
+ * placed into /system/lib/hw/hdmi_cec.so
  *
  * It will be loaded by the code in hardware/libhardware/hardware.c
  * which is itself called from
  * frameworks/base/services/core/jni/com_android_server_hdmi_HdmiCecController.cpp
  */
 
-#ifdef LOG_TAG
-#undef LOG_TAG
-#define LOG_TAG "hdmi_cec"
-#endif
 #include <cutils/log.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -42,23 +38,125 @@
 #include <sys/types.h>
 #include <hardware/hdmi_cec.h>
 #include <hardware/hardware.h>
+#include <cutils/properties.h>
+#include "hdmi_cec.h"
+
+#ifdef LOG_TAG
+#undef LOG_TAG
+#define LOG_TAG "CEC"
+#else
+#define LOG_TAG "CEC"
+#endif
 
 /* Set to 1 to enable debug messages to the log */
-#define DEBUG 0
+#define DEBUG 1
 #if DEBUG
-# define D(...) ALOGD(__VA_ARGS__)
+# define D(format, args...) ALOGD("[%s]"format, __func__, ##args)
 #else
 # define D(...) do{}while(0)
 #endif
 
-#define  E(...)  ALOGE(__VA_ARGS__)
+#define  E(format, args...) ALOGE("[%s]"format, __func__, ##args)
 
-static int dev_fd = -1;
+#define CEC_RX      0
+#define CEC_TX      1
 
-#define HDMITX_CEC_SYSFS "/sys/class/amhdmitx/amhdmitx0/cec"
-#define HDMITX_CEC_CONFIG_SYSFS "/sys/class/amhdmitx/amhdmitx0/cec_config"
-#define HDMITX_PHY_ADDR_SYSFS "/sys/class/amhdmitx/amhdmitx0/phy_addr"
-#define HDMITX_HPD_STATE_SYSFS "/sys/class/amhdmitx/amhdmitx0/hpd_state"
+#define CEC_FILE     "/dev/cec"
+#define MAX_PORT            8
+
+/*
+ * structures for platform cec implement
+ * @device_type : indentify type of cec device, such as tv or mbox
+ * @run         : run flag for rx poll thread
+ * @exit        : if rx poll thread is exited
+ * @addr_bitmap : bit maps for each valid logical address
+ * @fd          : file descriptor for global read/write
+ * @ThreadId    : pthread for poll cec rx message
+ * @cb_data     : data pointer for cec message RX call back
+ * @cb          : event call back for cec message RX
+ * @dev         : for hdmi_cec_device type
+ * @port_data   : array for port data
+ */
+struct aml_cec_hal {
+    int                         device_type;
+    int                         run;
+    int                         exited;
+    int                         addr_bitmap;
+    int                         fd;
+    pthread_t                   ThreadId;
+    void                       *cb_data;
+    event_callback_t            cb;
+    struct hdmi_cec_device     *dev;
+    struct hdmi_port_info      *port_data;
+};
+
+struct aml_cec_hal *hal_info = NULL;
+
+static int cec_rx_read_msg(unsigned char *buf, int msg_cnt)
+{
+    int i;
+    char *path = CEC_FILE;
+
+    if (msg_cnt <= 0 || !buf) {
+        return 0;
+    }
+    /* maybe blocked at driver */
+    i = read(hal_info->fd, buf, msg_cnt);
+    if (i < 0) {
+        E("read :%s failed, ret:%d\n", path, i);
+        return -1;
+    }
+    return i;
+}
+
+void *cec_rx_loop(void *data)
+{
+    struct aml_cec_hal *hal = (struct aml_cec_hal *)data;
+    hdmi_event_t event;
+    unsigned char msg_buf[CEC_MESSAGE_BODY_MAX_LENGTH];
+    int r;
+#if DEBUG
+    char buf[64] = {};
+    int size = 0, i;
+#endif
+
+    D("start\n");
+    while (hal_info->fd < 0) {
+        usleep(1000 * 1000);
+        hal_info->fd = open(CEC_FILE, O_RDWR);
+    }
+    D("file open ok\n");
+    while (hal && hal->run) {
+        memset(&event, 0, sizeof(event));
+        memset(msg_buf, 0, sizeof(msg_buf));
+
+        /* try to got a message from dev */
+        r = cec_rx_read_msg(msg_buf, CEC_MESSAGE_BODY_MAX_LENGTH);
+        if (r <= 1) { /* ignore received ping messages */
+            continue;
+        }
+    #if DEBUG
+        size = 0;
+        memset(buf, 0, sizeof(buf));
+        for (i = 0; i < r; i++) {
+            size += sprintf(buf + size, "%02x ", msg_buf[i]);
+        }
+        D("msg:%s", buf);
+    #endif
+        memcpy(event.cec.body, msg_buf + 1, r - 1);
+        event.type = HDMI_EVENT_CEC_MESSAGE;
+        event.dev = hal->dev;
+        event.cec.initiator   = (msg_buf[0] >> 4) & 0xf;
+        event.cec.destination = (msg_buf[0] >> 0) & 0xf;
+        event.cec.length      = r - 1;
+        if (hal->cb) {
+            hal->cb(&event, hal_info->cb_data);
+        }
+    }
+    D("end\n");
+    hal->exited = 1;
+    return 0;
+}
 
 /*
  * (*add_logical_address)() passes the logical address that will be used
@@ -72,10 +170,14 @@ static int dev_fd = -1;
  *
  * Returns 0 on success or -errno on error.
  */
-static int hdmitx_cec_add_logical_address(const struct hdmi_cec_device* dev, cec_logical_address_t addr)
+static int cec_add_logical_address(const struct hdmi_cec_device* dev, cec_logical_address_t addr)
 {
-    ALOGE("%s[%d] dev = %p addr = %d\n", __func__, __LINE__, dev, (unsigned int)addr);
-    return 0;
+    if (!hal_info || hal_info->fd < 0)
+        return -EINVAL;
+    if (addr < CEC_ADDR_BROADCAST)
+        hal_info->addr_bitmap |= (1 << addr);
+    D("dev:%p, addr:%x, bitmap:%x\n", dev, addr, hal_info->addr_bitmap);
+    return ioctl(hal_info->fd, CEC_IOC_ADD_LOGICAL_ADDR, addr);
 }
 
 /*
@@ -85,9 +187,13 @@ static int hdmitx_cec_add_logical_address(const struct hdmi_cec_device* dev, cec
  * hence to tell HAL to stop receiving commands from the CEC bus, and change
  * the state back to the beginning.
  */
-static void hdmitx_cec_clear_logical_address(const struct hdmi_cec_device* dev)
+static void cec_clear_logical_address(const struct hdmi_cec_device* dev)
 {
-    ALOGE("%s[%d] dev = %p\n", __func__, __LINE__, dev);
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+    hal_info->addr_bitmap = (1 << CEC_ADDR_BROADCAST);
+    D("dev:%p, bitmap:%x\n", dev, hal_info->addr_bitmap);
+    ioctl(hal_info->fd, CEC_IOC_CLR_LOGICAL_ADDR, 0);
 }
 
 /*
@@ -101,21 +207,14 @@ static void hdmitx_cec_clear_logical_address(const struct hdmi_cec_device* dev)
  *
  * Returns 0 on success or -errno on error.
  */
-static int hdmitx_cec_get_physical_address(const struct hdmi_cec_device* dev, uint16_t* addr)
+static int cec_get_physical_address(const struct hdmi_cec_device* dev, uint16_t* addr)
 {
-    int fd = 0;
-    char paddr[4] = {0};
-
-    dev = dev;
-    fd = open(HDMITX_PHY_ADDR_SYSFS, O_RDONLY);
-    if (fd < 0) {
-        ALOGE("%s[%d] cat get physical address\n", __func__, __LINE__);
-        return -1;
-    }
-    read(fd, paddr, 4);
-    close(fd);
-    *addr = (uint16_t)strtoul(paddr, NULL, 16);
-    return 0;
+    int ret;
+    if (!hal_info || hal_info->fd < 0)
+        return -EINVAL;
+    ret = ioctl(hal_info->fd, CEC_IOC_GET_PHYSICAL_ADDR, addr);
+    D("dev:%p, physical addr:%x\n", dev, *addr);
+    return ret;
 }
 
 /*
@@ -131,10 +230,49 @@ static int hdmitx_cec_get_physical_address(const struct hdmi_cec_device* dev, ui
  * Returns error code. See HDMI_RESULT_SUCCESS, HDMI_RESULT_NACK, and
  * HDMI_RESULT_BUSY.
  */
-static int hdmitx_cec_send_message(const struct hdmi_cec_device* dev, const cec_message_t* msg)
+static int cec_send_message(const struct hdmi_cec_device* dev, const cec_message_t* msg)
 {
-    ALOGE("%s[%d] dev = %p  msg = %p\n", __func__, __LINE__, dev, msg);
-    return HDMI_RESULT_SUCCESS;
+    int i, ret;
+    unsigned fail_reason = 0;
+    unsigned char msg_buf[CEC_MESSAGE_BODY_MAX_LENGTH] = {};
+#if DEBUG
+    char buf[64] = {};
+    int size = 0;
+#endif
+
+    if (!hal_info || hal_info->fd < 0)
+        return HDMI_RESULT_FAIL;
+
+#if DEBUG
+    memset(buf, 0, sizeof(buf));
+    for (i = 0; i < (int)msg->length; i++) {
+        size += sprintf(buf + size, "%02x ", msg->body[i]);
+    }
+    if (msg->length) {
+        D("[%x -> %x],len:%d, body:%s",
+          msg->initiator, msg->destination, msg->length, buf);
+    }
+#endif
+
+    memset(msg_buf, 0, sizeof(msg_buf));
+    msg_buf[0] = ((msg->initiator & 0xf) << 4) | (msg->destination & 0xf);
+    memcpy(msg_buf + 1, msg->body, msg->length);
+    ret = write(hal_info->fd, msg_buf, msg->length + 1);
+    if (ret > 0) {
+        return HDMI_RESULT_SUCCESS;
+    } else {
+        ioctl(hal_info->fd, CEC_IOC_GET_SEND_FAIL_REASON, &fail_reason);
+        if (msg->length)
+            D("fail reason:%x\n", fail_reason);
+        switch (fail_reason) {
+        case CEC_FAIL_NACK:
+            return HDMI_RESULT_NACK;
+        case CEC_FAIL_BUSY:
+            return HDMI_RESULT_BUSY;
+        default:
+            return HDMI_RESULT_FAIL;
+        }
+    }
 }
 
 /*
@@ -144,23 +282,25 @@ static int hdmitx_cec_send_message(const struct hdmi_cec_device* dev, const cec_
  * It will be passed back when the callback is invoked so that the context
  * can be retrieved.
  */
-static void hdmitx_cec_register_event_callback(const struct hdmi_cec_device* dev,
+static void cec_register_event_callback(const struct hdmi_cec_device* dev,
         event_callback_t callback, void* arg)
 {
-    dev = dev;
-    callback = callback;
-    arg = arg;
-    ALOGE("%s[%d]TODO\n", __func__, __LINE__);
-    //callback(, arg);
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+    D("dev:%p, callback:%p, arg:%p\n", callback, arg, dev);
+    hal_info->cb      = callback;
+    hal_info->cb_data = arg;
 }
 
 /*
  * (*get_version)() returns the CEC version supported by underlying hardware.
  */
-static void hdmitx_cec_get_version(const struct hdmi_cec_device* dev, int* version)
+static void cec_get_version(const struct hdmi_cec_device* dev, int* version)
 {
-    ALOGE("%s[%d] dev = %p  version = %p\n", __func__, __LINE__, dev, version);
-    *version = 0x14;
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+    ioctl(hal_info->fd, CEC_IOC_GET_VERSION, version);
+    D("dev:%p, version:%x\n", dev, *version);
 }
 
 /*
@@ -168,33 +308,47 @@ static void hdmitx_cec_get_version(const struct hdmi_cec_device* dev, int* versi
  * the 24-bit unique company ID obtained from the IEEE Registration
  * Authority Committee (RAC).
  */
-static void hdmitx_cec_get_vendor_id(const struct hdmi_cec_device* dev, uint32_t* vendor_id)
+static void cec_get_vendor_id(const struct hdmi_cec_device* dev, uint32_t* vendor_id)
 {
-    ALOGE("%s[%d] dev = %p  vendor_id = %p\n", __func__, __LINE__, dev, vendor_id);
-    *vendor_id = 0x4321;
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+    ioctl(hal_info->fd, CEC_IOC_GET_VENDOR_ID, vendor_id);
+    D("dev:%p, vendor_id:%x\n", dev, *vendor_id);
 }
-
-static struct hdmi_port_info hdmitx_port0 = {
-    .type = HDMI_OUTPUT,
-    // Port ID should start from 1 which corresponds to HDMI "port 1".
-    .port_id = 1,
-    .cec_supported = 1,
-    .arc_supported = 0,
-    .physical_address = 0x1000,
-};
 
 /*
  * (*get_port_info)() returns the hdmi port information of underlying hardware.
  * info is the list of HDMI port information, and 'total' is the number of
  * HDMI ports in the system.
  */
-// FIXED 1 port for MBox
-static void hdmitx_cec_get_port_info(const struct hdmi_cec_device* dev,
+static void cec_get_port_info(const struct hdmi_cec_device* dev,
         struct hdmi_port_info* list[], int* total)
 {
-    ALOGE("%s[%d] dev = %p  list = %p  total = %p\n", __func__, __LINE__, dev, list, total);
-    *total = 1;
-    list[0] = &hdmitx_port0;
+    int i;
+
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+
+    ioctl(hal_info->fd, CEC_IOC_GET_PORT_NUM, total);
+    D("dev:%p, total port:%d\n", dev, *total);
+    if (*total > MAX_PORT)
+        *total = MAX_PORT;
+    hal_info->port_data = malloc(sizeof(struct hdmi_port_info) * (*total));
+    if (!hal_info->port_data) {
+        E("alloc port_data failed\n");
+        *total = 0;
+        return ;
+    }
+    ioctl(hal_info->fd, CEC_IOC_GET_PORT_INFO, hal_info->port_data);
+    for (i = 0; i < *total; i++) {
+        D("port %d, type:%s, id:%d, cec support:%d, arc support:%d, physical address:%x\n",
+          i, hal_info->port_data[i].type ? "output" : "input",
+          hal_info->port_data[i].port_id,
+          hal_info->port_data[i].cec_supported,
+          hal_info->port_data[i].arc_supported,
+          hal_info->port_data[i].physical_address);
+    }
+    *list = hal_info->port_data;
 }
 
 /*
@@ -202,35 +356,33 @@ static void hdmitx_cec_get_port_info(const struct hdmi_cec_device* dev,
  * to HAL implementation. Those flags will be used in case the feature needs
  * update in HAL itself, firmware or microcontroller.
  */
-static void hdmitx_cec_set_option(const struct hdmi_cec_device* dev, int flag, int value)
+static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int value)
 {
-    int fd = 0;
+    int ret;
 
-    ALOGE("%s[%d] dev = %p  flag = %p  value = %p\n", __func__, __LINE__, dev, flag, value);
-    fd = open(HDMITX_CEC_CONFIG_SYSFS, O_WRONLY);
-    if (fd < 0) {
-        ALOGE("%s[%d][FILE]%s open failed\n", __func__, __LINE__, HDMITX_CEC_CONFIG_SYSFS);
+    if (!hal_info || hal_info->fd < 0)
         return ;
-    }
     switch (flag) {
     case HDMI_OPTION_ENABLE_CEC:
-        if (value == 1)
-            write(fd, "0xf", 3);
-        if (value == 0)
-            write(fd, "0x0", 3);
+        ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_ENALBE_CEC, value);
         break;
+
     case HDMI_OPTION_WAKEUP:
-        //Function: Automatic wake-up
-        //write(fd, "0xf", 3);
+        ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_WAKEUP, value);
         break;
+
     case HDMI_OPTION_SYSTEM_CEC_CONTROL:
-        ALOGE("%s[%d]HDMI_OPTION_SYSTEM_CEC_CONTROL TODO\n", __func__, __LINE__);
+        ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_SYS_CTRL, value);
         break;
+
+    case HDMI_OPTION_SET_LANG:
+        ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_SET_LANG, value);
+        break;
+
     default:
-        ALOGE("%s[%d] un-recognized flag = %d\n", __func__, __LINE__, flag);
         break;
     }
-    close(fd);
+    D("dev:%p, flag:%x, value:%x, ret:%d\n", dev, flag, value, ret);
 }
 
 /*
@@ -240,9 +392,12 @@ static void hdmitx_cec_set_option(const struct hdmi_cec_device* dev, int flag, i
  *
  * Returns 0 on success or -errno on error.
  */
-static void hdmitx_cec_set_audio_return_channel(const struct hdmi_cec_device* dev, int flag)
+static void cec_set_audio_return_channel(const struct hdmi_cec_device* dev, int port_id, int flag)
 {
-    ALOGE("%s[%d] dev = %p  flag = %p\n", __func__, __LINE__, dev, flag);
+    if (!hal_info || hal_info->fd < 0)
+        return ;
+    /* TODO: */
+    D("dev:%p, port id:%d, flag:%x\n", dev, port_id, flag);
 }
 
 /*
@@ -250,45 +405,68 @@ static void hdmitx_cec_set_audio_return_channel(const struct hdmi_cec_device* de
  * Returns HDMI_CONNECTED if a device is connected, otherwise HDMI_NOT_CONNECTED.
  * The HAL should watch for +5V power signal to determine the status.
  */
-static int hdmitx_cec_is_connected(const struct hdmi_cec_device* dev, int port_id)
+static int cec_is_connected(const struct hdmi_cec_device* dev, int port_id)
 {
-    int fd = 0;
-    char st = '0';
-    dev = dev;      // prevent warning
-    fd = open(HDMITX_HPD_STATE_SYSFS, O_RDONLY);
-    if (fd < 0) {
-        ALOGE("%s[%d][FILE]%s open failed\n", __func__, __LINE__, HDMITX_HPD_STATE_SYSFS);
-        return 1;
-    }
-    read(fd, &st, 1);
-    close(fd);
-    ALOGE("port_id = %d  cec_is_connected = %c\n", port_id, st);
-    return (st == '1') ? HDMI_CONNECTED : HDMI_NOT_CONNECTED;
+    int status = -1, ret;
+
+    if (!hal_info || hal_info->fd < 0)
+        return HDMI_NOT_CONNECTED;
+
+    /* use status pass port id */
+    status = port_id;
+    ret = ioctl(hal_info->fd, CEC_IOC_GET_CONNECT_STATUS, &status);
+    if (ret)
+        return HDMI_NOT_CONNECTED;
+    D("dev:%p, port:%d, connected:%s\n", dev, port_id, status ? "yes" : "no");
+    return (status) ? HDMI_CONNECTED : HDMI_NOT_CONNECTED;
 }
 
-/** Close the hdmitx cec device */
-static int hdmitx_cec_close(struct hw_device_t *dev)
+/** Close the hdmi cec device */
+static int cec_close(struct hw_device_t *dev)
 {
-    ALOGE("%s[%d] dev = %p n", __func__, __LINE__, dev);
-    if (dev_fd)
-        close(dev_fd);
+    if (!hal_info)
+        return -EINVAL;
+
+    hal_info->run = 0;
+    while (!hal_info->exited) {
+        usleep(100 * 1000);
+    }
     free(dev);
+    close(hal_info->fd);
+    free(hal_info->port_data);
+    free(hal_info);
+    D("closed ok\n");
     return 0;
 }
+
 /**
  * module methods
  */
-static int open_hdmitx_cec( const struct hw_module_t* module, char const *name,
+static int open_cec( const struct hw_module_t* module, char const *name,
         struct hw_device_t **device )
 {
-    ALOGE("%s[%d] %s\n", __func__, __LINE__, name);
+    char value[PROPERTY_VALUE_MAX] = {};
+
+    D("name:%s\n", name);
+    hal_info = malloc(sizeof(*hal_info));
+    if (!hal_info) {
+        D("%s, alloc memory failed\n", __func__);
+        return -EINVAL;
+    }
     if (strcmp(name, HDMI_CEC_HARDWARE_INTERFACE) != 0) {
-        ALOGE("hdmitx_cec strcmp fail !!!");
+        D("cec strcmp fail !!!");
         return -EINVAL;
     }
     if (device == NULL) {
-        ALOGE("NULL hdmitx_cec device on open");
+        D("NULL cec device on open");
         return -EINVAL;
+    }
+    property_get("ro.hdmi.device_type", value, "0");
+    D("get ro.hdmi.device_type:%s\n", value);
+    if (value[0] == '4') {
+        hal_info->device_type = CEC_TX;
+    } else {
+        hal_info->device_type = CEC_RX;
     }
 
     hdmi_cec_device_t *dev = malloc(sizeof(hdmi_cec_device_t));
@@ -297,37 +475,49 @@ static int open_hdmitx_cec( const struct hw_module_t* module, char const *name,
     dev->common.tag = HARDWARE_DEVICE_TAG;
     dev->common.version = 0;
     dev->common.module = (struct hw_module_t*) module;
-    dev->common.close = hdmitx_cec_close;
+    dev->common.close = cec_close;
 
-    dev->add_logical_address = hdmitx_cec_add_logical_address;
-    dev->clear_logical_address = hdmitx_cec_clear_logical_address;
-    dev->get_physical_address = hdmitx_cec_get_physical_address;
-    dev->send_message = hdmitx_cec_send_message;
-    dev->register_event_callback = hdmitx_cec_register_event_callback;
-    dev->get_version = hdmitx_cec_get_version;
-    dev->get_vendor_id = hdmitx_cec_get_vendor_id;
-    dev->get_port_info = hdmitx_cec_get_port_info;
-    dev->set_option = hdmitx_cec_set_option;
-    dev->set_audio_return_channel = hdmitx_cec_set_audio_return_channel;
-    dev->is_connected = hdmitx_cec_is_connected;
+    dev->add_logical_address      = cec_add_logical_address;
+    dev->clear_logical_address    = cec_clear_logical_address;
+    dev->get_physical_address     = cec_get_physical_address;
+    dev->send_message             = cec_send_message;
+    dev->register_event_callback  = cec_register_event_callback;
+    dev->get_version              = cec_get_version;
+    dev->get_vendor_id            = cec_get_vendor_id;
+    dev->get_port_info            = cec_get_port_info;
+    dev->set_option               = cec_set_option;
+    dev->set_audio_return_channel = cec_set_audio_return_channel;
+    dev->is_connected             = cec_is_connected;
 
     *device = (hw_device_t*) dev;
 
-    dev_fd = open(HDMITX_CEC_SYSFS, O_RDWR);
-    if (dev_fd < 0) {
-        ALOGE("open cec device error\n");
-        return -1;
+    hal_info->run         = 1;
+    hal_info->exited      = 0;
+    hal_info->ThreadId    = 0;
+    hal_info->dev         = dev;
+    hal_info->port_data   = NULL;
+    hal_info->addr_bitmap = (1 << CEC_ADDR_BROADCAST);
+    hal_info->cb_data     = NULL;
+    hal_info->cb          = NULL;
+    hal_info->fd          = open(CEC_FILE, O_RDWR);
+    if (hal_info->fd < 0) {
+        E("can't open %s\n", CEC_FILE);
+        return -EINVAL;
     }
+    pthread_create(&hal_info->ThreadId, NULL, cec_rx_loop, hal_info);
+
+    D("creat thread:%ld for poll cec message, fd:%d\n",
+      hal_info->ThreadId, hal_info->fd);
 
     return 0;
 }
 
-static struct hw_module_methods_t hdmitx_cec_module_methods = {
-    .open =  open_hdmitx_cec,
+static struct hw_module_methods_t hdmi_cec_module_methods = {
+    .open =  open_cec,
 };
 
 /*
- * The hdmitx cec Module
+ * The hdmi cec Module
  */
 struct hdmi_cec_module HAL_MODULE_INFO_SYM = {
     .common = {
@@ -335,9 +525,9 @@ struct hdmi_cec_module HAL_MODULE_INFO_SYM = {
         .module_api_version = HDMI_CEC_MODULE_API_VERSION_1_0,
         .hal_api_version    = HARDWARE_HAL_API_VERSION,
         .id                 = HDMI_CEC_HARDWARE_MODULE_ID,
-        .name               = "Amlogic hdmitx cec Module",
+        .name               = "Amlogic hdmi cec Module",
         .author             = "Amlogic Corp.",
-        .methods            = &hdmitx_cec_module_methods,
+        .methods            = &hdmi_cec_module_methods,
     },
 };
 

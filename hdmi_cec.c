@@ -58,11 +58,11 @@
 
 #define  E(format, args...) ALOGE("[%s]"format, __func__, ##args)
 
-#define CEC_RX      0
-#define CEC_TX      1
+#define CEC_RX          0
+#define CEC_TX          1
 
-#define CEC_FILE     "/dev/cec"
-#define MAX_PORT            8
+#define CEC_FILE        "/dev/cec"
+#define MAX_PORT        32
 
 /*
  * structures for platform cec implement
@@ -83,6 +83,8 @@ struct aml_cec_hal {
     int                         exited;
     int                         addr_bitmap;
     int                         fd;
+    int                         total_port;
+    unsigned int                con_status;
     pthread_t                   ThreadId;
     void                       *cb_data;
     event_callback_t            cb;
@@ -109,7 +111,39 @@ static int cec_rx_read_msg(unsigned char *buf, int msg_cnt)
     return i;
 }
 
-void *cec_rx_loop(void *data)
+static void check_connect_status(struct aml_cec_hal *hal)
+{
+    unsigned int prev_status, bit;
+    int i, port, ret;
+    hdmi_event_t event;
+
+    prev_status = hal->con_status;
+    for (i = 0; i < hal->total_port; i++) {
+        port = hal->port_data[i].port_id;
+        ret = ioctl(hal_info->fd, CEC_IOC_GET_CONNECT_STATUS, &port);
+        if (ret) {
+            D("get port %d connected status failed, ret:%d\n", hal->port_data[i].port_id, ret);
+            continue;
+        }
+        bit = prev_status & (1 << i);
+        if (bit ^ ((port ? 1 : 0) << i)) {
+            D("port:%d, connect status changed, now:%d, prev_status:%x\n",
+              hal->port_data[i].port_id, port, prev_status);
+            event.type = HDMI_EVENT_HOT_PLUG;
+            event.dev = hal->dev;
+            event.hotplug.connected = port;
+            event.hotplug.port_id = hal->port_data[i].port_id;
+            if (hal->cb) {
+                hal->cb(&event, hal_info->cb_data);
+            }
+            prev_status &= ~(bit);
+            prev_status |= ((port ? 1 : 0) << i);
+        }
+    }
+    hal->con_status = prev_status;
+}
+
+static void *cec_rx_loop(void *data)
 {
     struct aml_cec_hal *hal = (struct aml_cec_hal *)data;
     hdmi_event_t event;
@@ -127,6 +161,7 @@ void *cec_rx_loop(void *data)
     }
     D("file open ok\n");
     while (hal && hal->run) {
+        check_connect_status(hal);
         memset(&event, 0, sizeof(event));
         memset(msg_buf, 0, sizeof(msg_buf));
 
@@ -213,7 +248,7 @@ static int cec_get_physical_address(const struct hdmi_cec_device* dev, uint16_t*
     if (!hal_info || hal_info->fd < 0)
         return -EINVAL;
     ret = ioctl(hal_info->fd, CEC_IOC_GET_PHYSICAL_ADDR, addr);
-    D("dev:%p, physical addr:%x\n", dev, *addr);
+    D("dev:%p, physical addr:%x, ret:%d\n", dev, *addr, ret);
     return ret;
 }
 
@@ -333,6 +368,7 @@ static void cec_get_port_info(const struct hdmi_cec_device* dev,
     D("dev:%p, total port:%d\n", dev, *total);
     if (*total > MAX_PORT)
         *total = MAX_PORT;
+    hal_info->total_port = *total;
     hal_info->port_data = malloc(sizeof(struct hdmi_port_info) * (*total));
     if (!hal_info->port_data) {
         E("alloc port_data failed\n");
@@ -495,6 +531,8 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     hal_info->exited      = 0;
     hal_info->ThreadId    = 0;
     hal_info->dev         = dev;
+    hal_info->total_port  = 0;
+    hal_info->con_status  = 0;
     hal_info->port_data   = NULL;
     hal_info->addr_bitmap = (1 << CEC_ADDR_BROADCAST);
     hal_info->cb_data     = NULL;

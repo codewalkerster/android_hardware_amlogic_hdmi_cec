@@ -58,9 +58,6 @@
 
 #define  E(format, args...) ALOGE("[%s]"format, __func__, ##args)
 
-#define CEC_RX          0
-#define CEC_TX          1
-
 #define CEC_FILE        "/dev/cec"
 #define MAX_PORT        32
 
@@ -482,6 +479,7 @@ static int open_cec( const struct hw_module_t* module, char const *name,
         struct hw_device_t **device )
 {
     char value[PROPERTY_VALUE_MAX] = {};
+    int ret;
 
     D("name:%s\n", name);
     hal_info = malloc(sizeof(*hal_info));
@@ -500,9 +498,9 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     property_get("ro.hdmi.device_type", value, "0");
     D("get ro.hdmi.device_type:%s\n", value);
     if (value[0] == '4') {
-        hal_info->device_type = CEC_TX;
+        hal_info->device_type = DEV_TYPE_TX;
     } else {
-        hal_info->device_type = CEC_RX;
+        hal_info->device_type = DEV_TYPE_RX;
     }
 
     hdmi_cec_device_t *dev = malloc(sizeof(hdmi_cec_device_t));
@@ -542,6 +540,7 @@ static int open_cec( const struct hw_module_t* module, char const *name,
         E("can't open %s\n", CEC_FILE);
         return -EINVAL;
     }
+    ioctl(hal_info->fd, CEC_IOC_SET_DEV_TYPE, hal_info->device_type);
     pthread_create(&hal_info->ThreadId, NULL, cec_rx_loop, hal_info);
 
     D("creat thread:%ld for poll cec message, fd:%d\n",

@@ -135,6 +135,7 @@ static void check_connect_status(struct aml_cec_hal *hal)
             }
             prev_status &= ~(bit);
             prev_status |= ((port ? 1 : 0) << i);
+            D("now status:%x\n", prev_status);
         }
     }
     hal->con_status = prev_status;
@@ -427,10 +428,11 @@ static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int valu
  */
 static void cec_set_audio_return_channel(const struct hdmi_cec_device* dev, int port_id, int flag)
 {
+    int ret;
     if (!hal_info || hal_info->fd < 0)
         return ;
-    /* TODO: */
-    D("dev:%p, port id:%d, flag:%x\n", dev, port_id, flag);
+    ret = ioctl(hal_info->fd, CEC_IOC_SET_ARC_ENABLE, flag);
+    D("dev:%p, port id:%d, flag:%x, ret:%d\n", dev, port_id, flag, ret);
 }
 
 /*

@@ -40,6 +40,8 @@
 #include <hardware/hardware.h>
 #include <cutils/properties.h>
 #include "hdmi_cec.h"
+#include <jni.h>
+#include <JNIHelp.h>
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -61,6 +63,8 @@
 #define CEC_FILE        "/dev/cec"
 #define MAX_PORT        32
 
+#define MESSAGE_SET_MENU_LANGUAGE 0x32
+
 /*
  * structures for platform cec implement
  * @device_type : indentify type of cec device, such as tv or mbox
@@ -73,6 +77,10 @@
  * @cb          : event call back for cec message RX
  * @dev         : for hdmi_cec_device type
  * @port_data   : array for port data
+ * @onCecMessageRx   : for JNI call if got message
+ * @onAddAddress     : for event to extend process
+ * @env              : saved JNI enverioment
+ * @javavm           : java vm for jni
  */
 struct aml_cec_hal {
     int                         device_type;
@@ -81,12 +89,18 @@ struct aml_cec_hal {
     int                         addr_bitmap;
     int                         fd;
     int                         total_port;
+    int                         ext_control;
+    int                         flag;
     unsigned int                con_status;
     pthread_t                   ThreadId;
     void                       *cb_data;
     event_callback_t            cb;
     struct hdmi_cec_device     *dev;
     struct hdmi_port_info      *port_data;
+    jmethodID                   onCecMessageRx;
+    jmethodID                   onAddAddress;
+    jobject                     obj;
+    JavaVM                     *javavm;
 };
 
 struct aml_cec_hal *hal_info = NULL;
@@ -130,12 +144,12 @@ static void check_connect_status(struct aml_cec_hal *hal)
             event.dev = hal->dev;
             event.hotplug.connected = port;
             event.hotplug.port_id = hal->port_data[i].port_id;
-            if (hal->cb) {
+            if (hal->cb && (hal->flag & (1 << HDMI_OPTION_SYSTEM_CEC_CONTROL))) {
                 hal->cb(&event, hal_info->cb_data);
             }
             prev_status &= ~(bit);
             prev_status |= ((port ? 1 : 0) << i);
-            D("now status:%x\n", prev_status);
+            D("now mask:%x\n", prev_status);
         }
     }
     hal->con_status = prev_status;
@@ -151,6 +165,9 @@ static void *cec_rx_loop(void *data)
     char buf[64] = {};
     int size = 0, i;
 #endif
+    JNIEnv *env;
+    JavaVM *Vm;
+    int ret;
 
     D("start\n");
     while (hal_info->fd < 0) {
@@ -182,8 +199,33 @@ static void *cec_rx_loop(void *data)
         event.cec.initiator   = (msg_buf[0] >> 4) & 0xf;
         event.cec.destination = (msg_buf[0] >> 0) & 0xf;
         event.cec.length      = r - 1;
-        if (hal->cb) {
-            hal->cb(&event, hal_info->cb_data);
+        if (hal->device_type == DEV_TYPE_TX &&
+            msg_buf[1] == 0x32 &&
+            hal->ext_control) {
+            D("ignore menu language change for tx\n");
+        } else {
+            if (hal->cb && (hal->flag & (1 << HDMI_OPTION_SYSTEM_CEC_CONTROL))) {
+                hal->cb(&event, hal_info->cb_data);
+            }
+        }
+        /* call java method to process cec message for ext control */
+        if ((hal->ext_control == 0x03) &&
+            (hal->device_type == DEV_TYPE_TX) &&
+            (hal->flag & (1 << HDMI_OPTION_SYSTEM_CEC_CONTROL)) &&
+            (hal->javavm)) {
+            Vm = hal->javavm;
+            ret = (*Vm)->GetEnv(Vm, (void**)&env, JNI_VERSION_1_4);
+            if (ret < 0) {
+                ret = (*Vm)->AttachCurrentThread(Vm, &env, NULL);
+                if (ret < 0) {
+                    D("can't attach Vm");
+                    continue;
+                }
+            }
+            jbyteArray array = (*env)->NewByteArray(env, r);
+            (*env)->SetByteArrayRegion(env, array, 0, r, msg_buf);
+            (*env)->CallVoidMethod(env, hal->obj, hal->onCecMessageRx, array);
+            (*env)->DeleteLocalRef(env, array);
         }
     }
     D("end\n");
@@ -205,10 +247,31 @@ static void *cec_rx_loop(void *data)
  */
 static int cec_add_logical_address(const struct hdmi_cec_device* dev, cec_logical_address_t addr)
 {
+    JNIEnv *env;
+    JavaVM *Vm;
+    int ret;
+
     if (!hal_info || hal_info->fd < 0)
         return -EINVAL;
     if (addr < CEC_ADDR_BROADCAST)
         hal_info->addr_bitmap |= (1 << addr);
+
+    if (hal_info->ext_control) {
+        hal_info->ext_control |= (0x02);
+        if ((hal_info->device_type == DEV_TYPE_TX) &&
+            (hal_info->obj != NULL)) {
+            Vm = hal_info->javavm;
+            ret = (*Vm)->GetEnv(Vm, (void**)&env, JNI_VERSION_1_4);
+            if (ret < 0) {
+                ret = (*Vm)->AttachCurrentThread(Vm, &env, NULL);
+                if (ret < 0) {
+                    D("can't attach Vm");
+                }
+            } else if (hal_info->onAddAddress) {
+                (*env)->CallVoidMethod(env, hal_info->obj, hal_info->onAddAddress, addr);
+            }
+        }
+    }
     D("dev:%p, addr:%x, bitmap:%x\n", dev, addr, hal_info->addr_bitmap);
     return ioctl(hal_info->fd, CEC_IOC_ADD_LOGICAL_ADDR, addr);
 }
@@ -226,6 +289,9 @@ static void cec_clear_logical_address(const struct hdmi_cec_device* dev)
         return ;
     hal_info->addr_bitmap = (1 << CEC_ADDR_BROADCAST);
     D("dev:%p, bitmap:%x\n", dev, hal_info->addr_bitmap);
+    if (hal_info->ext_control) {
+        hal_info->ext_control &= ~(0x02);
+    }
     ioctl(hal_info->fd, CEC_IOC_CLR_LOGICAL_ADDR, 0);
 }
 
@@ -250,6 +316,22 @@ static int cec_get_physical_address(const struct hdmi_cec_device* dev, uint16_t*
     return ret;
 }
 
+static char *get_send_result(int r)
+{
+    switch (r) {
+    case HDMI_RESULT_SUCCESS:
+        return "success";
+    case HDMI_RESULT_NACK:
+        return "no ack";
+    case HDMI_RESULT_BUSY:
+        return "busy";
+    case HDMI_RESULT_FAIL:
+        return "fail other";
+    default:
+        return "unknown fail code";
+    }
+}
+
 /*
  * (*send_message)() transmits HDMI-CEC message to other HDMI device.
  *
@@ -266,46 +348,63 @@ static int cec_get_physical_address(const struct hdmi_cec_device* dev, uint16_t*
 static int cec_send_message(const struct hdmi_cec_device* dev, const cec_message_t* msg)
 {
     int i, ret;
-    unsigned fail_reason = 0;
     unsigned char msg_buf[CEC_MESSAGE_BODY_MAX_LENGTH] = {};
 #if DEBUG
     char buf[64] = {};
     int size = 0;
 #endif
 
-    if (!hal_info || hal_info->fd < 0)
+    /* should not send cec message if no connection */
+    if (!hal_info || hal_info->fd < 0 || !hal_info->con_status)
         return HDMI_RESULT_FAIL;
 
-#if DEBUG
-    memset(buf, 0, sizeof(buf));
-    for (i = 0; i < (int)msg->length; i++) {
-        size += sprintf(buf + size, "%02x ", msg->body[i]);
+    /* don't send message if controled by extend */
+    if (hal_info->ext_control == 0x03 && dev) {
+        return HDMI_RESULT_SUCCESS;
     }
-    if (msg->length) {
-        D("[%x -> %x],len:%d, body:%s",
-          msg->initiator, msg->destination, msg->length, buf);
-    }
-#endif
 
     memset(msg_buf, 0, sizeof(msg_buf));
     msg_buf[0] = ((msg->initiator & 0xf) << 4) | (msg->destination & 0xf);
     memcpy(msg_buf + 1, msg->body, msg->length);
     ret = write(hal_info->fd, msg_buf, msg->length + 1);
-    if (ret > 0) {
-        return HDMI_RESULT_SUCCESS;
-    } else {
-        ioctl(hal_info->fd, CEC_IOC_GET_SEND_FAIL_REASON, &fail_reason);
-        if (msg->length)
-            D("fail reason:%x\n", fail_reason);
-        switch (fail_reason) {
-        case CEC_FAIL_NACK:
-            return HDMI_RESULT_NACK;
-        case CEC_FAIL_BUSY:
-            return HDMI_RESULT_BUSY;
-        default:
-            return HDMI_RESULT_FAIL;
-        }
+#if DEBUG
+    memset(buf, 0, sizeof(buf));
+    for (i = 0; i < (int)msg->length; i++) {
+        size += sprintf(buf + size, "%02x ", msg->body[i]);
     }
+    D("[%x -> %x]len:%d, body:%s, result:%s\n",
+      msg->initiator, msg->destination, msg->length,
+      buf, get_send_result(ret));
+#endif
+    return ret;
+}
+
+/*
+ * export cec send message API for other usage
+ */
+int cec_send_message_ext(int dest, int len, unsigned char *buffer)
+{
+    int addr;
+    int i;
+    cec_message_t msg;
+
+    if (hal_info->device_type == DEV_TYPE_TX) {
+        addr = hal_info->addr_bitmap;
+        addr &= 0x7fff;
+        for (i = 0; i < 15; i++) {
+            if (addr & 1) {
+                break;
+            }
+            addr >>= 1;
+        }
+        msg.initiator = i;
+    } else {
+        msg.initiator = 0;  /* root for TV */
+    }
+    msg.destination = dest;
+    msg.length = len;
+    memcpy(msg.body, buffer, len);
+    return cec_send_message(NULL, &msg);
 }
 
 /*
@@ -407,6 +506,10 @@ static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int valu
 
     case HDMI_OPTION_SYSTEM_CEC_CONTROL:
         ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_SYS_CTRL, value);
+        if (value)
+            hal_info->flag |= (1 << HDMI_OPTION_SYSTEM_CEC_CONTROL);
+        else
+            hal_info->flag &= ~(1 << HDMI_OPTION_SYSTEM_CEC_CONTROL);
         break;
 
     case HDMI_OPTION_SET_LANG:
@@ -416,7 +519,8 @@ static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int valu
     default:
         break;
     }
-    D("dev:%p, flag:%x, value:%x, ret:%d\n", dev, flag, value, ret);
+    D("dev:%p, flag:%x, value:%x, ret:%d, hal_flag:%x\n",
+      dev, flag, value, ret, hal_info->flag);
 }
 
 /*
@@ -483,12 +587,12 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     char value[PROPERTY_VALUE_MAX] = {};
     int ret;
 
-    D("name:%s\n", name);
     hal_info = malloc(sizeof(*hal_info));
     if (!hal_info) {
         D("%s, alloc memory failed\n", __func__);
         return -EINVAL;
     }
+    memset(hal_info, 0, sizeof(*hal_info));
     if (strcmp(name, HDMI_CEC_HARDWARE_INTERFACE) != 0) {
         D("cec strcmp fail !!!");
         return -EINVAL;
@@ -504,6 +608,14 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     } else {
         hal_info->device_type = DEV_TYPE_RX;
     }
+    memset(value, 0, sizeof(value));
+    property_get("persist.sys.hdmi.keep_awake", value, "true");
+    if (!strcmp(value, "false")) {
+        hal_info->ext_control = 1;
+    } else {
+        hal_info->ext_control = 0;
+    }
+    D("ext control:%d, %s", hal_info->ext_control, value);
 
     hdmi_cec_device_t *dev = malloc(sizeof(hdmi_cec_device_t));
     memset(dev, 0, sizeof(hdmi_cec_device_t));
@@ -538,15 +650,15 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     hal_info->cb_data     = NULL;
     hal_info->cb          = NULL;
     hal_info->fd          = open(CEC_FILE, O_RDWR);
+    hal_info->javavm      = NULL;
+    hal_info->obj         = NULL;
+    hal_info->flag        = 0;
     if (hal_info->fd < 0) {
         E("can't open %s\n", CEC_FILE);
         return -EINVAL;
     }
-    ioctl(hal_info->fd, CEC_IOC_SET_DEV_TYPE, hal_info->device_type);
+    ret = ioctl(hal_info->fd, CEC_IOC_SET_DEV_TYPE, hal_info->device_type);
     pthread_create(&hal_info->ThreadId, NULL, cec_rx_loop, hal_info);
-
-    D("creat thread:%ld for poll cec message, fd:%d\n",
-      hal_info->ThreadId, hal_info->fd);
 
     return 0;
 }
@@ -569,4 +681,118 @@ struct hdmi_cec_module HAL_MODULE_INFO_SYM = {
         .methods            = &hdmi_cec_module_methods,
     },
 };
+
+JNIEXPORT int JNICALL
+Java_com_droidlogic_app_HdmiCecExtend_nativeSendCecMessage(JNIEnv *env, jobject thiz, jint dest, jbyteArray body)
+{
+    jbyte *ba = (*env)->GetByteArrayElements(env, body, JNI_FALSE);
+    jsize len = (*env)->GetArrayLength(env, body);
+
+    return cec_send_message_ext(dest, len, ba);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidlogic_app_HdmiCecExtend_nativeInit(JNIEnv *env, jobject thiz, jobject obj)
+{
+    jobject obj1;
+    if (hal_info != NULL) {
+        obj1 = (*env)->NewGlobalRef(env, obj);
+        hal_info->obj = obj1;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droidlogic_app_HdmiCecExtend_nativeGetPhysicalAddr(JNIEnv *env, jobject thiz)
+{
+    unsigned short addr = -1;
+    if (cec_get_physical_address(hal_info->dev, &addr) < 0) {
+        return -1;
+    }
+
+    return addr;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droidlogic_app_HdmiCecExtend_nativeGetVendorId(JNIEnv *env, jobject thiz)
+{
+    unsigned int id = 0;
+
+    cec_get_vendor_id(hal_info->dev, &id);
+    return id;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droidlogic_app_HdmiCecExtend_nativeGetCecVersion(JNIEnv *env, jobject thiz)
+{
+    int version = 0;
+
+    cec_get_version(hal_info->dev, &version);
+    return version;
+}
+
+static JNINativeMethod hdmiExtend_method[] = {
+    {"nativeSendCecMessage", "(I[B)I", (void *)Java_com_droidlogic_app_HdmiCecExtend_nativeSendCecMessage},
+    {"nativeInit", "(Lcom/droidlogic/HdmiCecExtend;)V", (void *)Java_com_droidlogic_app_HdmiCecExtend_nativeInit},
+    {"nativeGetPhysicalAddr", "()I", (void *)Java_com_droidlogic_app_HdmiCecExtend_nativeGetPhysicalAddr},
+    {"nativeGetVendorId", "()I", (void *)Java_com_droidlogic_app_HdmiCecExtend_nativeGetVendorId},
+    {"nativeGetCecVersion", "()I", (void *)Java_com_droidlogic_app_HdmiCecExtend_nativeGetCecVersion},
+};
+
+static int registerNativeMethods(JNIEnv* env, const char* className,
+        const JNINativeMethod* methods, int numMethods)
+{
+    int rc;
+    jclass clazz;
+    clazz = (*env)->FindClass(env, className);
+
+    if (clazz == NULL) {
+        D("NULL clazz\n");
+        return -1;
+    }
+
+    if ((rc = ((*env)->RegisterNatives(env, clazz, methods, numMethods))) < 0) {
+        return -1;
+    }
+
+    if (hal_info != NULL) {
+        hal_info->onCecMessageRx = (*env)->GetMethodID(env, clazz, "onCecMessageRx", "([B)V");
+        if (hal_info->onCecMessageRx == NULL) {
+            D("can't found method onCecMessageRx");
+        } else {
+            D("got method onCecMessageRx, env:%p", env);
+        }
+        hal_info->onAddAddress = (*env)->GetMethodID(env, clazz, "onAddAddress", "(I)V");
+        if (hal_info->onAddAddress == NULL) {
+            D("can't found method onAddAddress");
+        } else {
+            D("got method onAddAddress, env:%p", env);
+        }
+    }
+
+    return 0;
+}
+
+
+JNIEXPORT jint
+JNI_OnLoad(JavaVM* vm, void* reserved)
+{
+    JNIEnv* env = NULL;
+    jint result = -1;
+
+    if ((*vm)->GetEnv(vm, (void**) &env, JNI_VERSION_1_4) != JNI_OK) {
+        D("GetEnv failed!\n");
+        return result;
+    }
+    if (registerNativeMethods(env,
+                              "com/droidlogic/HdmiCecExtend",
+                              hdmiExtend_method,
+                              NELEM(hdmiExtend_method)) < 0) {
+        D("registerNativeMethods failed\n");
+    }
+    if (hal_info) {
+        hal_info->javavm = vm;
+    }
+
+    return JNI_VERSION_1_4;
+}
 

@@ -129,7 +129,7 @@ static void check_connect_status(struct aml_cec_hal *hal)
     hdmi_event_t event;
 
     prev_status = hal->con_status;
-    for (i = 0; i < hal->total_port; i++) {
+    for (i = 0; i < hal->total_port && hal->port_data != NULL; i++) {
         port = hal->port_data[i].port_id;
         ret = ioctl(hal_info->fd, CEC_IOC_GET_CONNECT_STATUS, &port);
         if (ret) {
@@ -465,7 +465,6 @@ static void cec_get_port_info(const struct hdmi_cec_device* dev,
     D("dev:%p, total port:%d\n", dev, *total);
     if (*total > MAX_PORT)
         *total = MAX_PORT;
-    hal_info->total_port = *total;
     hal_info->port_data = malloc(sizeof(struct hdmi_port_info) * (*total));
     if (!hal_info->port_data) {
         E("alloc port_data failed\n");
@@ -482,6 +481,7 @@ static void cec_get_port_info(const struct hdmi_cec_device* dev,
           hal_info->port_data[i].physical_address);
     }
     *list = hal_info->port_data;
+    hal_info->total_port = *total;
 }
 
 /*

@@ -20,7 +20,7 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES := hdmi_cec.c
 LOCAL_PRELINK_MODULE := false
 LOCAL_MODULE_RELATIVE_PATH := hw
-LOCAL_SHARED_LIBRARIES := liblog libcutils
+LOCAL_SHARED_LIBRARIES := liblog libcutils libnativehelper
 LOCAL_MODULE := hdmi_cec.amlogic
 LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)

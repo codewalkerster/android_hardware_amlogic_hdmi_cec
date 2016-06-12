@@ -23,7 +23,13 @@
 #define CEC_FAIL_BUSY                   2
 #define CEC_FAIL_OTHER                  3
 
-#define DEV_TYPE_RX                     0
-#define DEV_TYPE_TX                     4
+#define DEV_TYPE_TV                     0
+#define DEV_TYPE_RECORDER               1
+#define DEV_TYPE_RESERVED               2
+#define DEV_TYPE_TUNER                  3
+#define DEV_TYPE_PLAYBACK               4
+#define DEV_TYPE_AUDIO_SYSTEM           5
+#define DEV_TYPE_PURE_CEC_SWITCH        6
+#define DEV_TYPE_VIDEO_PROCESSOR        7
 
 #endif /* __HDMI_CEC_H__ */

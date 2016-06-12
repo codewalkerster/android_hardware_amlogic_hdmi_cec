@@ -199,7 +199,7 @@ static void *cec_rx_loop(void *data)
         event.cec.initiator   = (msg_buf[0] >> 4) & 0xf;
         event.cec.destination = (msg_buf[0] >> 0) & 0xf;
         event.cec.length      = r - 1;
-        if (hal->device_type == DEV_TYPE_TX &&
+        if (hal->device_type == DEV_TYPE_PLAYBACK &&
             msg_buf[1] == 0x32 &&
             hal->ext_control) {
             D("ignore menu language change for tx\n");
@@ -210,7 +210,7 @@ static void *cec_rx_loop(void *data)
         }
         /* call java method to process cec message for ext control */
         if ((hal->ext_control == 0x03) &&
-            (hal->device_type == DEV_TYPE_TX) &&
+            (hal->device_type == DEV_TYPE_PLAYBACK) &&
             (hal->flag & (1 << HDMI_OPTION_SYSTEM_CEC_CONTROL)) &&
             (hal->javavm)) {
             Vm = hal->javavm;
@@ -258,7 +258,7 @@ static int cec_add_logical_address(const struct hdmi_cec_device* dev, cec_logica
 
     if (hal_info->ext_control) {
         hal_info->ext_control |= (0x02);
-        if ((hal_info->device_type == DEV_TYPE_TX) &&
+        if ((hal_info->device_type == DEV_TYPE_PLAYBACK) &&
             (hal_info->obj != NULL)) {
             Vm = hal_info->javavm;
             ret = (*Vm)->GetEnv(Vm, (void**)&env, JNI_VERSION_1_4);
@@ -354,8 +354,7 @@ static int cec_send_message(const struct hdmi_cec_device* dev, const cec_message
     int size = 0;
 #endif
 
-    /* should not send cec message if no connection */
-    if (!hal_info || hal_info->fd < 0 || !hal_info->con_status)
+    if (!hal_info || hal_info->fd < 0)
         return HDMI_RESULT_FAIL;
 
     /* don't send message if controled by extend */
@@ -388,7 +387,7 @@ int cec_send_message_ext(int dest, int len, unsigned char *buffer)
     int i;
     cec_message_t msg;
 
-    if (hal_info->device_type == DEV_TYPE_TX) {
+    if (hal_info->device_type == DEV_TYPE_PLAYBACK) {
         addr = hal_info->addr_bitmap;
         addr &= 0x7fff;
         for (i = 0; i < 15; i++) {
@@ -585,6 +584,7 @@ static int open_cec( const struct hw_module_t* module, char const *name,
         struct hw_device_t **device )
 {
     char value[PROPERTY_VALUE_MAX] = {};
+    int dev_type;
     int ret;
 
     hal_info = malloc(sizeof(*hal_info));
@@ -601,12 +601,14 @@ static int open_cec( const struct hw_module_t* module, char const *name,
         D("NULL cec device on open");
         return -EINVAL;
     }
-    property_get("ro.hdmi.device_type", value, "0");
-    D("get ro.hdmi.device_type:%s\n", value);
-    if (value[0] == '4') {
-        hal_info->device_type = DEV_TYPE_TX;
+    property_get("ro.hdmi.device_type", value, "4");
+    D("ro.hdmi.device_type:%s\n", value);
+    ret = sscanf(value, "%d", &dev_type);
+    if (ret == 1 &&
+       (dev_type >= DEV_TYPE_TV && dev_type <= DEV_TYPE_VIDEO_PROCESSOR)) {
+        hal_info->device_type = dev_type;
     } else {
-        hal_info->device_type = DEV_TYPE_RX;
+        hal_info->device_type = DEV_TYPE_PLAYBACK;
     }
     memset(value, 0, sizeof(value));
     property_get("persist.sys.hdmi.keep_awake", value, "true");
@@ -659,6 +661,7 @@ static int open_cec( const struct hw_module_t* module, char const *name,
     }
     ret = ioctl(hal_info->fd, CEC_IOC_SET_DEV_TYPE, hal_info->device_type);
     pthread_create(&hal_info->ThreadId, NULL, cec_rx_loop, hal_info);
+    pthread_setname_np(hal_info->ThreadId, "cec_rx_loop");
 
     return 0;
 }

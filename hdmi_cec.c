@@ -511,6 +511,11 @@ static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int valu
             hal_info->flag &= ~(1 << HDMI_OPTION_SYSTEM_CEC_CONTROL);
         break;
 
+    /* set device auto-power off by uboot */
+    case HDMI_OPTION_CEC_AUTO_DEVICE_OFF:
+        ret = ioctl(hal_info->fd, CEC_IOC_SET_AUTO_DEVICE_OFF, value);
+        break;
+
     case HDMI_OPTION_SET_LANG:
         ret = ioctl(hal_info->fd, CEC_IOC_SET_OPTION_SET_LANG, value);
         break;

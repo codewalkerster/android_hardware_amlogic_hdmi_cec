@@ -528,6 +528,34 @@ static void cec_set_option(const struct hdmi_cec_device* dev, int flag, int valu
 }
 
 /*
+ * get connect status when boot
+ */
+static void get_boot_connect_status(struct aml_cec_hal *hal_info)
+{
+    unsigned int total;
+    int i, port, ret;
+
+    ret = ioctl(hal_info->fd, CEC_IOC_GET_PORT_NUM, &total);
+    D("total port:%d, ret:%d\n", total, ret);
+    if (ret < 0)
+        return ;
+
+    if (total > MAX_PORT)
+        total = MAX_PORT;
+    hal_info->con_status = 0;
+    for (i = 0; i < total; i++) {
+        port = i + 1;
+        ret = ioctl(hal_info->fd, CEC_IOC_GET_CONNECT_STATUS, &port);
+        if (ret) {
+            D("get port %d connected status failed, ret:%d\n", i, ret);
+            continue;
+        }
+        hal_info->con_status |= ((port ? 1 : 0) << i);
+    }
+    D("con_status:%x\n", hal_info->con_status);
+}
+
+/*
  * (*set_audio_return_channel)() configures ARC circuit in the hardware logic
  * to start or stop the feature. Flag can be either 1 to start the feature
  * or 0 to stop it.
@@ -665,6 +693,7 @@ static int open_cec( const struct hw_module_t* module, char const *name,
         return -EINVAL;
     }
     ret = ioctl(hal_info->fd, CEC_IOC_SET_DEV_TYPE, hal_info->device_type);
+    get_boot_connect_status(hal_info);
     pthread_create(&hal_info->ThreadId, NULL, cec_rx_loop, hal_info);
     pthread_setname_np(hal_info->ThreadId, "cec_rx_loop");
 

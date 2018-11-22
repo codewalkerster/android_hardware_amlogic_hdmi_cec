@@ -36,7 +36,7 @@ LOCAL_SHARED_LIBRARIES := \
   libcutils \
   libhdmicec
 
-LOCAL_MODULE := hdmi_cec.amlogic
+LOCAL_MODULE := hdmi_cec.$(TARGET_PRODUCT)
 LOCAL_MODULE_TAGS := optional
 
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 26 && echo OK),OK)
